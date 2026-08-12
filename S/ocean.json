@@ -1,0 +1,15 @@
+{
+    "mcpServers": {
+        "ocean": {
+            "command": "uv",
+            "args": [
+                "run",
+                "--with",
+                "mcp[cli]",
+                "mcp",
+                "run",
+                "S/ocean.py"
+            ]
+        }
+    }
+}
