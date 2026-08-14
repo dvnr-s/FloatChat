@@ -4,6 +4,8 @@ from sqlalchemy import create_engine, text
 import chromadb
 import json
 import os
+import re
+from datetime import datetime
 from dotenv import load_dotenv
 
 # Project root (this file lives in <root>/S), so paths work regardless of cwd
@@ -25,6 +27,21 @@ engine = create_engine(DATABASE_URL) if DATABASE_URL else None
 # Chroma vector DB
 chroma_client = chromadb.PersistentClient(path=os.path.join(BASE_DIR, "chroma"))
 collection = chroma_client.get_or_create_collection("water_landmarks")
+
+def _as_date(value, fallback):
+    """Coerce whatever the extractor returned into a YYYY-MM-DD string."""
+    if not value:
+        return fallback
+    text_value = str(value).strip()
+    if re.fullmatch(r"\d{4}", text_value):          # bare year
+        return f"{text_value}-01-01" if fallback.startswith("2000") else f"{text_value}-12-31"
+    if re.fullmatch(r"\d{4}-\d{2}", text_value):    # year-month
+        return f"{text_value}-01"
+    try:
+        return datetime.fromisoformat(text_value.replace("Z", "+00:00")).date().isoformat()
+    except ValueError:
+        return fallback
+
 
 @mcp.tool()
 def summarize_ocean_data(user_query: str, n: int = 5):
@@ -93,8 +110,10 @@ def summarize_ocean_data(user_query: str, n: int = 5):
 
     # Step 3: Run SQL query for EACH parameter
     lat, lon = context.get("latitude"), context.get("longitude")
-    t_start = context.get("time_start") or "2000-01-01"
-    t_end = context.get("time_end") or "2100-01-01"
+    # The extractor sometimes emits "2024" or "last year" — anything Postgres
+    # can't cast would now abort the query, so fall back to an open bound.
+    t_start = _as_date(context.get("time_start"), "2000-01-01")
+    t_end = _as_date(context.get("time_end"), "2100-01-01")
 
     if engine is None:
         return {"error": "POSTGRES_URI is not set in .env", "context": context}
@@ -106,14 +125,18 @@ def summarize_ocean_data(user_query: str, n: int = 5):
             "context": context,
         }
 
+    # measurement_time IS filtered here — leaving it out made every answer fall
+    # back to whatever the LIMIT happened to catch. Newest first, so a question
+    # with no explicit date range gets the most recent profiles.
     sql = text("""
-        SELECT parameter_name, parameter_value, measurement_time, latitude, longitude, depth_pressure
+        SELECT parameter_name, parameter_value, parameter_unit, measurement_time,
+               latitude, longitude, depth_pressure, platform_number
         FROM argofinal
         WHERE parameter_name = :param
           AND latitude BETWEEN :lat_min AND :lat_max
           AND longitude BETWEEN :lon_min AND :lon_max
-          
-        ORDER BY measurement_time ASC
+          AND measurement_time BETWEEN :t_start AND :t_end
+        ORDER BY measurement_time DESC, depth_pressure ASC
         LIMIT 200
     """)
 
@@ -131,8 +154,39 @@ def summarize_ocean_data(user_query: str, n: int = 5):
     except Exception as e:
         return {"error": f"Database query failed: {e}", "context": context}
 
-   
+    # Pre-compute the numbers the model would otherwise try to eyeball from 200
+    # raw rows — it gets them wrong, and a summary is what the user asked for.
+    summary = {}
+    for param, rows in all_results.items():
+        if not rows:
+            summary[param] = {"n": 0}
+            continue
+        vals = [float(r["parameter_value"]) for r in rows if r["parameter_value"] is not None]
+        depths = [float(r["depth_pressure"]) for r in rows if r["depth_pressure"] is not None]
+        times = [r["measurement_time"] for r in rows if r["measurement_time"]]
+        summary[param] = {
+            "n": len(rows),
+            "unit": rows[0].get("parameter_unit"),
+            "value_min": round(min(vals), 4) if vals else None,
+            "value_max": round(max(vals), 4) if vals else None,
+            "value_mean": round(sum(vals) / len(vals), 4) if vals else None,
+            "surface_value": round(vals[0], 4) if vals else None,
+            "depth_min_m": round(min(depths), 1) if depths else None,
+            "depth_max_m": round(max(depths), 1) if depths else None,
+            "latest_reading": max(times).isoformat() if times else None,
+            "earliest_reading": min(times).isoformat() if times else None,
+            "platforms": sorted({r["platform_number"] for r in rows if r.get("platform_number")}),
+        }
+
     return {
         "context": context,
-        "data": all_results
+        "summary": summary,
+        "data": all_results,
+        "presentation": (
+            "Answer in GitHub-flavoured Markdown. Lead with a one-sentence takeaway, "
+            "then a table with columns | Parameter | Surface | Range | Mean | Depth span | Latest reading |, "
+            "using the numbers in `summary` verbatim. Do not list individual rows and do not "
+            "invent values. Close with one short 'What this means' line in plain language. "
+            "Do not print your Thought/Action reasoning."
+        ),
     }
